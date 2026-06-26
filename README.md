@@ -98,7 +98,98 @@ The `get` command displays:
   - Passed checks (summarized count)
 - **Blocking discussions** (GitLab): Whether blocking discussions are resolved
 
-## Examples
+## Example Output
+
+### GitHub
+
+```
+$ review get 42
+Fetching unresolved comments for owner/repo#42...
+📋 Found 2 unresolved review thread(s):
+
+── Thread 3423986075: src/main.py:15 ──
+
+Consider using a context manager here.
+
+🔗 Link: https://github.com/owner/repo/pull/42#discussion_r3423986075
+
+─── Response 3426283699 by @author:
+
+Good point, fixed in latest push.
+
+🔗 Link: https://github.com/owner/repo/pull/42#discussion_r3426283699
+
+== Thread end 3423986075: src/main.py:15 ==
+── Thread 3436744571: README.md:8 (outdated) ──
+
+Typo in the description.
+
+🔗 Link: https://github.com/owner/repo/pull/42#discussion_r3436744571
+
+== Thread end 3436744571: README.md:8 (outdated) ==
+
+============================================================
+📊 Review Threads Summary:
+ * Addressed threads: 2 / 2
+ * Responded: 1
+ * Outdated: 1
+
+────────────────────────────────────────────────────────────
+🔍 PR Status:
+ ❌ Reviews: CHANGES REQUESTED
+   💬 Commented by: reviewer1
+ ✅ Mergeable: YES
+ ⚠️ State: UNSTABLE
+ ❌ Checks: FAILURE
+
+📝 Checks breakdown (3 total):
+ ❌ Failed (1):
+      • build (FAILURE)
+        https://github.com/owner/repo/actions/runs/123/job/456
+ ✅ Passed (2)
+```
+
+### GitLab
+
+```
+$ review get 1
+Fetching unresolved comments for group/project!1...
+📋 Found 1 unresolved review thread(s):
+
+── Thread 564776ce: docs/design.md:74 ──
+
+Should we add a sequence diagram here?
+
+🔗 Link: https://gitlab.example.com/group/project/-/merge_requests/1#note_22158853
+
+─── Response 22160030 by @author:
+
+Good idea, added in the latest commit.
+
+🔗 Link: https://gitlab.example.com/group/project/-/merge_requests/1#note_22160030
+
+== Thread end 564776ce: docs/design.md:74 ==
+
+============================================================
+📊 Review Threads Summary:
+ * Addressed threads: 1 / 1
+ * Responded: 1
+ * Outdated: 0
+
+────────────────────────────────────────────────────────────
+🔍 PR Status:
+ ✅ Reviews: APPROVED
+   ✅ Approved by: reviewer1
+ ✅ Mergeable: YES
+ ✅ State: CLEAN
+ ✅ Blocking discussions: resolved
+ ✅ Checks: SUCCESS
+
+📝 Checks breakdown (1 total):
+ ✅ Passed (1)
+```
+
+## Commands
 
 ```bash
 # Check current PR/MR for unresolved comments
