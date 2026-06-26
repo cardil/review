@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Fetch and manage review comments from GitHub PRs and GitLab MRs.
+
+Based on: https://stackoverflow.com/a/66072198/844449
+
+Usage:
+    review get [MR_NUMBER]            # Get unresolved comments
+    review reply <thread_id> <file|-> # Reply to a review thread
+"""
+
+import configparser
+import re
+import sys
+import subprocess
+from pathlib import Path
+
+_CACHE_FILE = Path.home() / ".cache" / "review" / "forges.ini"
+
+# Resolve script directory so sibling modules can be imported regardless of cwd
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from forge import Forge  # noqa: E402
+from github import GitHubForge  # noqa: E402
+from gitlab import GitLabForge  # noqa: E402
+
+
+# ─── Cache / Forge Detection ─────────────────────────────────────────────────
+
+
+def _get_remote_hostname() -> str | None:
+    result = subprocess.run(
+        ["git", "remote", "-v"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        url = parts[1]
+
+        # SSH: git@host:path or ssh://git@host/path
+        ssh_match = re.match(r"(?:ssh://)?git@([^:/]+)", url)
+        if ssh_match:
+            return ssh_match.group(1)
+
+        # HTTPS: https://host/path
+        https_match = re.match(r"https?://([^/]+)", url)
+        if https_match:
+            return https_match.group(1)
+
+    return None
+
+
+def _load_cache() -> configparser.ConfigParser:
+    config = configparser.ConfigParser()
+    if _CACHE_FILE.exists():
+        config.read(_CACHE_FILE)
+    return config
+
+
+def _save_cache(config: configparser.ConfigParser) -> None:
+    _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(_CACHE_FILE, "w") as f:
+        config.write(f)
+
+
+def _update_cache(hostname: str, forge_type: str) -> None:
+    config = _load_cache()
+    if not config.has_section("forges"):
+        config.add_section("forges")
+    config.set("forges", hostname, forge_type)
+    _save_cache(config)
+
+
+def _make_forge(forge_type: str) -> Forge:
+    return GitHubForge() if forge_type == "github" else GitLabForge()
+
+
+def _alternate_forge(forge: Forge) -> tuple[Forge, str]:
+    if isinstance(forge, GitHubForge):
+        return GitLabForge(), "gitlab"
+    return GitHubForge(), "github"
+
+
+def detect_forge() -> Forge:
+    hostname = _get_remote_hostname()
+    if not hostname:
+        return GitHubForge()
+
+    config = _load_cache()
+    if not config.has_section("forges"):
+        config.add_section("forges")
+
+    if config.has_option("forges", hostname):
+        forge_type = config.get("forges", hostname)
+        return _make_forge(forge_type)
+
+    forge_type = "github" if hostname == "github.com" else "gitlab"
+    config.set("forges", hostname, forge_type)
+    _save_cache(config)
+    return _make_forge(forge_type)
+
+
+# ─── Commands ─────────────────────────────────────────────────────────────────
+
+
+def cmd_get(args: list[str]) -> None:
+    hostname = _get_remote_hostname()
+    forge = detect_forge()
+
+    threads: list[dict] | None = None
+    status: dict | None = None
+
+    try:
+        mr_number = forge.get_mr_number(args)
+        threads, status = forge.fetch_unresolved_threads(mr_number)
+    except RuntimeError:
+        alt_forge, alt_type = _alternate_forge(forge)
+        try:
+            mr_number = alt_forge.get_mr_number(args)
+            threads, status = alt_forge.fetch_unresolved_threads(mr_number)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        if hostname:
+            _update_cache(hostname, alt_type)
+        forge = alt_forge
+
+    forge.print_threads(threads, status)
+
+
+def cmd_reply(args: list[str]) -> None:
+    if len(args) < 2:
+        print("Usage: review reply <thread_id> <file|->", file=sys.stderr)
+        sys.exit(1)
+
+    thread_id = args[0]
+    body_source = args[1]
+
+    if body_source == "-":
+        body = sys.stdin.read()
+    else:
+        try:
+            with open(body_source, "r") as f:
+                body = f.read()
+        except FileNotFoundError:
+            print(f"Error: File not found: {body_source}", file=sys.stderr)
+            sys.exit(1)
+
+    if not body.strip():
+        print("Error: Comment body is empty", file=sys.stderr)
+        sys.exit(1)
+
+    hostname = _get_remote_hostname()
+    forge = detect_forge()
+
+    try:
+        forge.reply_to_thread(thread_id, body)
+    except RuntimeError:
+        alt_forge, alt_type = _alternate_forge(forge)
+        try:
+            alt_forge.reply_to_thread(thread_id, body)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        if hostname:
+            _update_cache(hostname, alt_type)
+
+
+def cmd_help() -> None:
+    help_text = """review - Fetch and manage review comments from GitHub PRs and GitLab MRs
+
+Usage:
+    review get [MR_NUMBER]            # Get unresolved comments
+    review reply <thread_id> <file|-> # Reply to a review thread
+    review help                       # Show this help message
+
+Supported forges: GitHub (github.com), GitLab (any other hostname)
+Forge is auto-detected from git remote hostname and cached in
+~/.cache/review/forges.ini. Self-heals if the assumed forge API fails.
+
+Commands:
+    get [MR_NUMBER]
+        Fetch unresolved review comments for a PR or MR.
+        If MR_NUMBER is omitted, uses the current branch's PR/MR.
+
+    reply <thread_id> <file|->
+        Reply to a review thread using its thread ID.
+        Use '-' to read the comment body from stdin.
+        Use a file path to read the comment body from a file.
+
+Examples:
+    review get                        # Get comments for current PR/MR
+    review get 123                    # Get comments for PR/MR #123
+    review reply 1234567 response.md  # Reply with content from file
+    echo "LGTM" | review reply 1234567 -  # Reply with stdin
+"""
+    print(help_text)
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        print("Usage: review <command>", file=sys.stderr)
+        print("Run 'review help' for usage information.", file=sys.stderr)
+        sys.exit(1)
+
+    command = sys.argv[1]
+
+    if command == "get":
+        cmd_get(sys.argv[2:])
+    elif command == "reply":
+        cmd_reply(sys.argv[2:])
+    elif command in ("help", "-h", "--help"):
+        cmd_help()
+    else:
+        print(f"Unknown command: {command}", file=sys.stderr)
+        print("Run 'review help' for usage information.", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
