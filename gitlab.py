@@ -74,7 +74,7 @@ class GitLabForge(Forge):
         encoded_path = urllib.parse.quote(project_path, safe="")
         print(f"Fetching unresolved comments for {project_path}!{mr_number}...")
 
-        discussions = self._api_get(f"projects/{encoded_path}/merge_requests/{mr_number}/discussions")
+        discussions = self._api_get(f"projects/{encoded_path}/merge_requests/{mr_number}/discussions", paginate=True)
         mr_data = self._api_get(f"projects/{encoded_path}/merge_requests/{mr_number}")
         approvals_data = self._api_get(f"projects/{encoded_path}/merge_requests/{mr_number}/approvals")
 
@@ -183,7 +183,8 @@ class GitLabForge(Forge):
         mr_number = self.get_mr_number([])
 
         discussions = self._api_get(
-            f"projects/{encoded_path}/merge_requests/{mr_number}/discussions"
+            f"projects/{encoded_path}/merge_requests/{mr_number}/discussions",
+            paginate=True,
         )
 
         matches = [
@@ -225,12 +226,11 @@ class GitLabForge(Forge):
         print(f"✅ Successfully replied to thread {thread_id}")
 
     @staticmethod
-    def _api_get(endpoint: str) -> dict | list:
-        result = subprocess.run(
-            ["glab", "api", endpoint],
-            capture_output=True,
-            text=True,
-        )
+    def _api_get(endpoint: str, paginate: bool = False) -> dict | list:
+        cmd = ["glab", "api", endpoint]
+        if paginate:
+            cmd.append("--paginate")
+        result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"GitLab API error: {result.stderr}")
         return json.loads(result.stdout)

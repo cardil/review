@@ -150,7 +150,14 @@ class GitHubForge(Forge):
                 raise RuntimeError(f"GitHub API error: {result.stderr}")
 
             data = json.loads(result.stdout)
+            if "errors" in data:
+                error_msg = data["errors"][0].get("message", "Unknown error")
+                raise RuntimeError(f"GitHub API error: {error_msg}")
+
             pr_data = data["data"]["repository"]["pullRequest"]
+            if not pr_data:
+                raise RuntimeError(f"Could not find GitHub PR #{mr_number}")
+
             threads_data = pr_data["reviewThreads"]
 
             if pr_status_raw is None:
