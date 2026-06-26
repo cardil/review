@@ -1,0 +1,1006 @@
+#!/usr/bin/env python3
+"""Fetch and manage review comments from GitHub PRs and GitLab MRs.
+
+Based on: https://stackoverflow.com/a/66072198/844449
+
+Usage:
+    review get [MR_NUMBER]            # Get unresolved comments
+    review reply <thread_id> <file|-> # Reply to a review thread
+"""
+
+import abc
+import configparser
+import json
+import re
+import subprocess
+import sys
+import urllib.parse
+from pathlib import Path
+
+_CACHE_FILE = Path.home() / ".cache" / "review" / "forges.ini"
+
+
+# ─── Forge ABC ────────────────────────────────────────────────────────────────
+
+
+class Forge(abc.ABC):
+    """Abstract base for forge (GitHub/GitLab) implementations."""
+
+    @abc.abstractmethod
+    def get_mr_number(self, args: list[str]) -> int:
+        """Return MR/PR number from CLI arg or current branch."""
+
+    @abc.abstractmethod
+    def fetch_unresolved_threads(self, mr_number: int) -> tuple[list[dict], dict]:
+        """Fetch unresolved threads; return (threads, status) in normalized shape.
+
+        Normalized thread shape:
+            {
+                "thread_id": str,      # GitHub: discussion_r ID; GitLab: first 8 chars of hex ID
+                "path": str | None,    # file path (None for non-diff comments)
+                "line": int | str,     # line number or "?"
+                "is_outdated": bool,
+                "comments": [
+                    {
+                        "author": str,
+                        "body": str,
+                        "url": str,
+                        "comment_id": str,  # for response delimiter
+                    }
+                ]
+            }
+
+        Normalized status shape:
+            {
+                "review_summary": str | None,    # "APPROVED", "CHANGES_REQUESTED", etc.
+                "reviewers": [{"login": str, "state": str}],
+                "mergeable": str,                # "MERGEABLE", "CONFLICTING", etc.
+                "merge_state": str,              # "CLEAN", "BLOCKED", etc.
+                "checks": dict | None,           # status check rollup
+            }
+        """
+
+    def print_threads(self, threads: list[dict], status: dict) -> None:
+        """Print unresolved threads in a readable format (shared implementation)."""
+        if not threads:
+            print("✅ No unresolved review comments!")
+        else:
+            print(f"📋 Found {len(threads)} unresolved review thread(s):\n")
+
+            total_threads = len(threads)
+            outdated_count = 0
+            responded_count = 0
+            addressed_count = 0
+
+            for thread in threads:
+                path = thread["path"]
+                line = thread["line"]
+                is_outdated = thread["is_outdated"]
+                outdated = " (outdated)" if is_outdated else ""
+                thread_id = thread["thread_id"]
+
+                has_response = len(thread["comments"]) > 1
+
+                if is_outdated:
+                    outdated_count += 1
+                if has_response:
+                    responded_count += 1
+                if has_response or is_outdated:
+                    addressed_count += 1
+
+                if path is not None:
+                    print(f"── Thread {thread_id}: {path}:{line}{outdated} ──")
+                else:
+                    print(f"── Thread {thread_id}{outdated} ──")
+
+                for idx, comment in enumerate(thread["comments"]):
+                    author = comment["author"]
+                    body = comment["body"]
+                    url = comment["url"]
+                    comment_id = comment["comment_id"]
+
+                    if idx > 0:
+                        print(f"─── Response {comment_id} by @{author}:")
+                    print()
+                    for line_text in body.split("\n"):
+                        print(f"{line_text}")
+                    print()
+                    print(f"🔗 Link: {url}")
+                    print()
+
+                if path is not None:
+                    print(f"== Thread end {thread_id}: {path}:{line}{outdated} ==")
+                else:
+                    print(f"== Thread end {thread_id}{outdated} ==")
+
+            print("\n" + "=" * 60)
+            print("📊 Review Threads Summary:")
+            print(f" * Addressed threads: {addressed_count} / {total_threads}")
+            print(f" * Responded: {responded_count}")
+            print(f" * Outdated: {outdated_count}")
+
+        # Print MR/PR status summary
+        print("\n" + "─" * 60)
+        print("🔍 PR Status:")
+
+        review_summary = status.get("review_summary")
+        if review_summary == "APPROVED":
+            print(" ✅ Reviews: APPROVED")
+        elif review_summary == "CHANGES_REQUESTED":
+            print(" ❌ Reviews: CHANGES REQUESTED")
+        elif review_summary == "REVIEW_REQUIRED":
+            print(" ⏳ Reviews: REVIEW REQUIRED")
+        elif review_summary is None:
+            print(" ⏳ Reviews: No reviews yet")
+        else:
+            print(f" ❓ Reviews: {review_summary}")
+
+        reviewers = status.get("reviewers", [])
+        if reviewers:
+            approved = []
+            changes_requested = []
+            commented = []
+
+            for reviewer in reviewers:
+                login = reviewer.get("login", "unknown")
+                state = reviewer.get("state")
+
+                if state == "APPROVED":
+                    approved.append(login)
+                elif state == "CHANGES_REQUESTED":
+                    changes_requested.append(login)
+                elif state == "COMMENTED":
+                    commented.append(login)
+
+            if approved:
+                print(f"   ✅ Approved by: {', '.join(approved)}")
+            if changes_requested:
+                print(f"   ❌ Changes requested by: {', '.join(changes_requested)}")
+            if commented:
+                print(f"   💬 Commented by: {', '.join(commented)}")
+
+        mergeable = status.get("mergeable")
+        merge_state = status.get("merge_state")
+
+        if mergeable == "MERGEABLE":
+            print(" ✅ Mergeable: YES")
+        elif mergeable == "CONFLICTING":
+            print(" ❌ Mergeable: NO (conflicts)")
+        elif mergeable == "UNKNOWN":
+            print(" ⏳ Mergeable: UNKNOWN (calculating...)")
+        else:
+            print(f" ❓ Mergeable: {mergeable}")
+
+        merge_state_icon = {
+            "CLEAN": "✅",
+            "UNSTABLE": "⚠️",
+            "DIRTY": "❌",
+            "BLOCKED": "🚫",
+            "BEHIND": "⬅️",
+            "DRAFT": "📝",
+            "UNKNOWN": "❓",
+        }.get(merge_state, "❓")
+        print(f" {merge_state_icon} State: {merge_state or 'UNKNOWN'}")
+
+        # GitLab-specific: blocking discussions
+        blocking_resolved = status.get("blocking_discussions_resolved")
+        if blocking_resolved is not None:
+            if blocking_resolved:
+                print(" ✅ Blocking discussions: resolved")
+            else:
+                print(" 🚫 Blocking discussions: NOT resolved")
+
+        rollup = status.get("checks")
+        if rollup:
+            overall_state = rollup.get("state", "UNKNOWN")
+            state_icon = {
+                "SUCCESS": "✅",
+                "PENDING": "⏳",
+                "FAILURE": "❌",
+                "ERROR": "❌",
+                "EXPECTED": "⏳",
+            }.get(overall_state, "❓")
+            print(f" {state_icon} Checks: {overall_state}")
+
+            contexts = rollup.get("contexts", {}).get("nodes", [])
+            if contexts:
+                print(f"\n📝 Checks breakdown ({len(contexts)} total):")
+
+                success_checks = []
+                pending_checks = []
+                failed_checks = []
+
+                for ctx in contexts:
+                    if ctx.get("__typename") == "CheckRun":
+                        name = ctx.get("name", "Unknown")
+                        conclusion = ctx.get("conclusion")
+                        status_val = ctx.get("status")
+                        url = ctx.get("detailsUrl", "")
+
+                        if conclusion == "SUCCESS":
+                            success_checks.append((name, url))
+                        elif conclusion in ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"):
+                            failed_checks.append((name, conclusion, url))
+                        elif status_val in ("IN_PROGRESS", "QUEUED", "PENDING", "WAITING"):
+                            pending_checks.append((name, status_val, url))
+                        else:
+                            # Treat neutral/skipped as success
+                            success_checks.append((name, url))
+
+                    elif ctx.get("__typename") == "StatusContext":
+                        name = ctx.get("context", "Unknown")
+                        state = ctx.get("state")
+                        url = ctx.get("targetUrl", "")
+
+                        if state == "SUCCESS":
+                            success_checks.append((name, url))
+                        elif state in ("FAILURE", "ERROR"):
+                            failed_checks.append((name, state, url))
+                        elif state == "PENDING":
+                            pending_checks.append((name, state, url))
+
+                # Print failed checks first (most important)
+                if failed_checks:
+                    print(f" ❌ Failed ({len(failed_checks)}):")
+                    for name, status_val, url in failed_checks:
+                        print(f"      • {name} ({status_val})")
+                        if url:
+                            print(f"        {url}")
+
+                # Then pending checks
+                if pending_checks:
+                    print(f" ⏳ Pending ({len(pending_checks)}):")
+                    for name, status_val, url in pending_checks:
+                        print(f"      • {name} ({status_val})")
+
+                # Finally successful checks (collapsed)
+                if success_checks:
+                    print(f" ✅ Passed ({len(success_checks)})")
+        else:
+            print("❓ Checks: No status information available")
+
+    @abc.abstractmethod
+    def reply_to_thread(self, thread_id: str, body: str) -> None:
+        """Reply to a review thread."""
+
+
+# ─── GitHub Forge ─────────────────────────────────────────────────────────────
+
+
+class GitHubForge(Forge):
+    """GitHub implementation using gh CLI."""
+
+    def get_mr_number(self, args: list[str]) -> int:
+        if args:
+            try:
+                return int(args[0])
+            except ValueError:
+                print(f"Error: Invalid PR number: {args[0]}", file=sys.stderr)
+                sys.exit(1)
+
+        result = subprocess.run(
+            ["gh", "pr", "view", "--json", "number", "--jq", ".number"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+
+        raise RuntimeError("Could not determine PR number")
+
+    def _get_repo_info(self) -> tuple[str, str]:
+        result = subprocess.run(
+            [
+                "gh",
+                "repo",
+                "view",
+                "--json",
+                "owner,name",
+                "--jq",
+                "[.owner.login, .name] | @tsv",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("Could not determine GitHub repository")
+        parts = result.stdout.strip().split("\t")
+        return parts[0], parts[1]
+
+    def fetch_unresolved_threads(self, mr_number: int) -> tuple[list[dict], dict]:
+        owner, repo = self._get_repo_info()
+        print(f"Fetching unresolved comments for {owner}/{repo}#{mr_number}...")
+
+        query = """
+        query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
+            repository(owner: $owner, name: $repo) {
+                pullRequest(number: $pr) {
+                    mergeable
+                    mergeStateStatus
+                    reviewDecision
+                    latestReviews(first: 100) {
+                        nodes {
+                            author {
+                                login
+                            }
+                            state
+                            submittedAt
+                        }
+                    }
+                    commits(last: 1) {
+                        nodes {
+                            commit {
+                                statusCheckRollup {
+                                    state
+                                    contexts(first: 100) {
+                                        nodes {
+                                            __typename
+                                            ... on CheckRun {
+                                                name
+                                                conclusion
+                                                status
+                                                detailsUrl
+                                            }
+                                            ... on StatusContext {
+                                                context
+                                                state
+                                                targetUrl
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    reviewThreads(first: 100, after: $cursor) {
+                        pageInfo {
+                            hasNextPage
+                            endCursor
+                        }
+                        nodes {
+                            id
+                            isResolved
+                            isOutdated
+                            path
+                            line
+                            comments(first: 20) {
+                                nodes {
+                                    author {
+                                        login
+                                    }
+                                    body
+                                    createdAt
+                                    url
+                                    id
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+
+        variables: dict = {"owner": owner, "repo": repo, "pr": mr_number, "cursor": None}
+        all_threads_raw = []
+        has_next_page = True
+        pr_status_raw = None
+
+        while has_next_page:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    "graphql",
+                    "-f",
+                    f"query={query}",
+                    "-f",
+                    f"owner={owner}",
+                    "-f",
+                    f"repo={repo}",
+                    "-F",
+                    f"pr={mr_number}",
+                    "-f",
+                    f"cursor={variables['cursor'] or ''}",
+                ],
+                capture_output=True,
+                text=True,
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(f"GitHub API error: {result.stderr}")
+
+            data = json.loads(result.stdout)
+            pr_data = data["data"]["repository"]["pullRequest"]
+            threads_data = pr_data["reviewThreads"]
+
+            if pr_status_raw is None:
+                pr_status_raw = {
+                    "mergeable": pr_data.get("mergeable"),
+                    "mergeStateStatus": pr_data.get("mergeStateStatus"),
+                    "reviewDecision": pr_data.get("reviewDecision"),
+                    "latestReviews": pr_data.get("latestReviews", {}).get("nodes", []),
+                    "statusCheckRollup": None,
+                }
+                commits = pr_data.get("commits", {}).get("nodes", [])
+                if commits and commits[0].get("commit", {}).get("statusCheckRollup"):
+                    pr_status_raw["statusCheckRollup"] = commits[0]["commit"]["statusCheckRollup"]
+
+            for thread in threads_data["nodes"]:
+                if not thread["isResolved"]:
+                    all_threads_raw.append(thread)
+
+            has_next_page = threads_data["pageInfo"]["hasNextPage"]
+            variables["cursor"] = threads_data["pageInfo"]["endCursor"]
+
+        # Normalize threads to common shape
+        normalized_threads = []
+        for thread in all_threads_raw:
+            comments = []
+            for comment in thread["comments"]["nodes"]:
+                author = comment["author"]["login"] if comment["author"] else "unknown"
+                url = comment["url"]
+                comment_id = url.split("discussion_r")[-1] if "discussion_r" in url else "?"
+                comments.append(
+                    {
+                        "author": author,
+                        "body": comment["body"],
+                        "url": url,
+                        "comment_id": comment_id,
+                    }
+                )
+
+            first_url = (
+                thread["comments"]["nodes"][0].get("url", "")
+                if thread["comments"]["nodes"]
+                else ""
+            )
+            thread_id = (
+                first_url.split("discussion_r")[-1] if "discussion_r" in first_url else "?"
+            )
+
+            normalized_threads.append(
+                {
+                    "thread_id": thread_id,
+                    "path": thread["path"],
+                    "line": thread.get("line", "?"),
+                    "is_outdated": thread["isOutdated"],
+                    "comments": comments,
+                }
+            )
+
+        # Normalize status to common shape
+        normalized_status: dict = {
+            "review_summary": pr_status_raw.get("reviewDecision"),
+            "reviewers": [
+                {
+                    "login": r.get("author", {}).get("login", "unknown"),
+                    "state": r.get("state"),
+                }
+                for r in pr_status_raw.get("latestReviews", [])
+                if r.get("author")
+            ],
+            "mergeable": pr_status_raw.get("mergeable"),
+            "merge_state": pr_status_raw.get("mergeStateStatus"),
+            "checks": pr_status_raw.get("statusCheckRollup"),
+        }
+
+        return normalized_threads, normalized_status
+
+    def _get_pr_for_comment(self, owner: str, repo: str, comment_id: str) -> int:
+        url = f"/repos/{owner}/{repo}/pulls/comments/{comment_id}"
+        result = subprocess.run(
+            ["gh", "api", url],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Error finding comment: {result.stderr}")
+
+        data = json.loads(result.stdout)
+        pr_url = data.get("pull_request_url", "")
+        if pr_url:
+            return int(pr_url.rstrip("/").split("/")[-1])
+
+        raise RuntimeError(f"Could not find PR for comment {comment_id}")
+
+    def reply_to_thread(self, thread_id: str, body: str) -> None:
+        owner, repo = self._get_repo_info()
+        pr_number = self._get_pr_for_comment(owner, repo, thread_id)
+
+        url = f"/repos/{owner}/{repo}/pulls/{pr_number}/comments/{thread_id}/replies"
+        result = subprocess.run(
+            ["gh", "api", "-X", "POST", url, "-f", f"body={body}"],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Error replying to thread: {result.stderr}")
+
+        print(f"✅ Successfully replied to thread {thread_id}")
+
+
+# ─── GitLab Forge ─────────────────────────────────────────────────────────────
+
+
+class GitLabForge(Forge):
+    """GitLab implementation using glab CLI."""
+
+    def get_mr_number(self, args: list[str]) -> int:
+        if args:
+            try:
+                return int(args[0])
+            except ValueError:
+                print(f"Error: Invalid MR number: {args[0]}", file=sys.stderr)
+                sys.exit(1)
+
+        result = subprocess.run(
+            ["glab", "mr", "view", "--output", "json"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            return data["iid"]
+
+        raise RuntimeError("Could not determine MR number")
+
+    def _get_project_path(self) -> str:
+        result = subprocess.run(
+            ["glab", "repo", "view", "--output", "json"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("Could not determine GitLab project")
+        data = json.loads(result.stdout)
+        return data["path_with_namespace"]
+
+    def fetch_unresolved_threads(self, mr_number: int) -> tuple[list[dict], dict]:
+        project_path = self._get_project_path()
+        encoded_path = urllib.parse.quote(project_path, safe="")
+        print(f"Fetching unresolved comments for {project_path}!{mr_number}...")
+
+        # Fetch discussions
+        result = subprocess.run(
+            [
+                "glab",
+                "api",
+                f"projects/{encoded_path}/merge_requests/{mr_number}/discussions",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"GitLab API error: {result.stderr}")
+        discussions = json.loads(result.stdout)
+
+        # Fetch MR status
+        result = subprocess.run(
+            ["glab", "api", f"projects/{encoded_path}/merge_requests/{mr_number}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"GitLab API error: {result.stderr}")
+        mr_data = json.loads(result.stdout)
+
+        # Fetch approvals
+        result = subprocess.run(
+            [
+                "glab",
+                "api",
+                f"projects/{encoded_path}/merge_requests/{mr_number}/approvals",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"GitLab API error: {result.stderr}")
+        approvals_data = json.loads(result.stdout)
+
+        web_url = mr_data.get("web_url", "")
+
+        # Normalize threads to common shape
+        normalized_threads = []
+        for discussion in discussions:
+            # Skip individual notes (system events: commits, review requests, etc.)
+            if discussion.get("individual_note", True):
+                continue
+
+            notes = discussion.get("notes", [])
+            if not notes:
+                continue
+
+            first_note = notes[0]
+
+            # Skip non-resolvable discussions
+            if not first_note.get("resolvable", False):
+                continue
+
+            # Show only unresolved
+            if first_note.get("resolved", True):
+                continue
+
+            discussion_id = discussion.get("id", "")
+            thread_id = discussion_id[:8] if len(discussion_id) >= 8 else discussion_id
+
+            position = first_note.get("position")
+            if position:
+                path = position.get("new_path")
+                line = position.get("new_line") or position.get("old_line") or "?"
+            else:
+                path = None
+                line = "?"
+
+            comments = []
+            for note in notes:
+                note_author = note.get("author", {}).get("username", "unknown")
+                note_id = note.get("id", "")
+                note_url = f"{web_url}#note_{note_id}"
+                comments.append(
+                    {
+                        "author": note_author,
+                        "body": note.get("body", ""),
+                        "url": note_url,
+                        "comment_id": str(note_id),
+                    }
+                )
+
+            normalized_threads.append(
+                {
+                    "thread_id": thread_id,
+                    "path": path,
+                    "line": line,
+                    "is_outdated": False,  # No direct flag in GitLab v1
+                    "comments": comments,
+                }
+            )
+
+        # Normalize status to common shape
+        is_approved = approvals_data.get("approved", False)
+        approved_by = approvals_data.get("approved_by", [])
+        reviewers = [
+            {"login": entry["user"]["username"], "state": "APPROVED"}
+            for entry in approved_by
+            if entry.get("user")
+        ]
+
+        review_summary = "APPROVED" if is_approved else "REVIEW_REQUIRED"
+
+        has_conflicts = mr_data.get("has_conflicts", False)
+        mergeable_str = "CONFLICTING" if has_conflicts else "MERGEABLE"
+
+        detailed_merge_status = mr_data.get("detailed_merge_status", "")
+        merge_state_map = {
+            "mergeable": "CLEAN",
+            "conflicts": "DIRTY",
+            "draft_status": "DRAFT",
+            "discussions_not_resolved": "BLOCKED",
+            "not_approved": "BLOCKED",
+            "ci_must_pass": "UNSTABLE",
+            "ci_still_running": "UNSTABLE",
+            "checking": "UNKNOWN",
+            "approvals_syncing": "UNKNOWN",
+            "not_open": "BLOCKED",
+            "broken_status": "DIRTY",
+        }
+        merge_state = merge_state_map.get(
+            detailed_merge_status,
+            detailed_merge_status.upper() if detailed_merge_status else "UNKNOWN",
+        )
+
+        # Normalize pipeline as statusCheckRollup-compatible checks dict
+        pipeline = mr_data.get("pipeline")
+        checks = None
+        if pipeline:
+            pipeline_status = pipeline.get("status", "unknown")
+            pipeline_state_map = {
+                "success": "SUCCESS",
+                "failed": "FAILURE",
+                "canceled": "SUCCESS",
+                "skipped": "SUCCESS",
+                "pending": "PENDING",
+                "running": "PENDING",
+                "created": "PENDING",
+                "waiting_for_resource": "PENDING",
+                "preparing": "PENDING",
+                "manual": "PENDING",
+                "scheduled": "PENDING",
+            }
+            normalized_pipeline_state = pipeline_state_map.get(pipeline_status, "UNKNOWN")
+            checks = {
+                "state": normalized_pipeline_state,
+                "contexts": {
+                    "nodes": [
+                        {
+                            "__typename": "StatusContext",
+                            "context": "GitLab Pipeline",
+                            "state": normalized_pipeline_state,
+                            "targetUrl": pipeline.get("web_url", ""),
+                        }
+                    ]
+                },
+            }
+
+        normalized_status: dict = {
+            "review_summary": review_summary,
+            "reviewers": reviewers,
+            "mergeable": mergeable_str,
+            "merge_state": merge_state,
+            "checks": checks,
+            "blocking_discussions_resolved": mr_data.get("blocking_discussions_resolved"),
+        }
+
+        return normalized_threads, normalized_status
+
+    def reply_to_thread(self, thread_id: str, body: str) -> None:
+        project_path = self._get_project_path()
+        encoded_path = urllib.parse.quote(project_path, safe="")
+        mr_number = self.get_mr_number([])
+
+        # Fetch all discussions to resolve short prefix to full discussion ID
+        result = subprocess.run(
+            [
+                "glab",
+                "api",
+                f"projects/{encoded_path}/merge_requests/{mr_number}/discussions",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Error fetching discussions: {result.stderr}")
+
+        discussions = json.loads(result.stdout)
+
+        matches = [
+            disc.get("id", "")
+            for disc in discussions
+            if disc.get("id", "").startswith(thread_id)
+        ]
+
+        if len(matches) == 0:
+            print(f"Error: No discussion found matching prefix '{thread_id}'", file=sys.stderr)
+            sys.exit(1)
+        elif len(matches) > 1:
+            print(
+                f"Error: Ambiguous thread ID '{thread_id}', matches:", file=sys.stderr
+            )
+            for m in matches:
+                print(f"  {m}", file=sys.stderr)
+            sys.exit(1)
+
+        full_discussion_id = matches[0]
+
+        result = subprocess.run(
+            [
+                "glab",
+                "api",
+                "-X",
+                "POST",
+                f"projects/{encoded_path}/merge_requests/{mr_number}/discussions/{full_discussion_id}/notes",
+                "-f",
+                f"body={body}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Error replying to thread: {result.stderr}")
+
+        print(f"✅ Successfully replied to thread {thread_id}")
+
+
+# ─── Cache / Forge Detection ──────────────────────────────────────────────────
+
+
+def _get_remote_hostname() -> str | None:
+    """Extract hostname from git remotes."""
+    result = subprocess.run(
+        ["git", "remote", "-v"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        url = parts[1]
+
+        # SSH format: git@host:path or ssh://git@host/path
+        ssh_match = re.match(r"(?:ssh://)?git@([^:/]+)", url)
+        if ssh_match:
+            return ssh_match.group(1)
+
+        # HTTPS format: https://host/path
+        https_match = re.match(r"https?://([^/]+)", url)
+        if https_match:
+            return https_match.group(1)
+
+    return None
+
+
+def _load_cache() -> configparser.ConfigParser:
+    config = configparser.ConfigParser()
+    if _CACHE_FILE.exists():
+        config.read(_CACHE_FILE)
+    return config
+
+
+def _save_cache(config: configparser.ConfigParser) -> None:
+    _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(_CACHE_FILE, "w") as f:
+        config.write(f)
+
+
+def _update_cache(hostname: str, forge_type: str) -> None:
+    config = _load_cache()
+    if not config.has_section("forges"):
+        config.add_section("forges")
+    config.set("forges", hostname, forge_type)
+    _save_cache(config)
+
+
+def _make_forge(forge_type: str) -> Forge:
+    return GitHubForge() if forge_type == "github" else GitLabForge()
+
+
+def _alternate_forge(forge: Forge) -> tuple[Forge, str]:
+    if isinstance(forge, GitHubForge):
+        return GitLabForge(), "gitlab"
+    return GitHubForge(), "github"
+
+
+def detect_forge() -> Forge:
+    """Detect forge from git remote hostname with caching."""
+    hostname = _get_remote_hostname()
+    if not hostname:
+        return GitHubForge()
+
+    config = _load_cache()
+    if not config.has_section("forges"):
+        config.add_section("forges")
+
+    if config.has_option("forges", hostname):
+        forge_type = config.get("forges", hostname)
+        return _make_forge(forge_type)
+
+    # Not cached -- apply defaults
+    forge_type = "github" if hostname == "github.com" else "gitlab"
+    config.set("forges", hostname, forge_type)
+    _save_cache(config)
+    return _make_forge(forge_type)
+
+
+# ─── Commands ────────────────────────────────────────────────────────────────
+
+
+def cmd_get(args: list[str]) -> None:
+    """Handle 'get' command to fetch unresolved comments."""
+    hostname = _get_remote_hostname()
+    forge = detect_forge()
+
+    threads: list[dict] | None = None
+    status: dict | None = None
+
+    try:
+        mr_number = forge.get_mr_number(args)
+        threads, status = forge.fetch_unresolved_threads(mr_number)
+    except RuntimeError:
+        # Self-healing: try the other forge
+        alt_forge, alt_type = _alternate_forge(forge)
+        try:
+            mr_number = alt_forge.get_mr_number(args)
+            threads, status = alt_forge.fetch_unresolved_threads(mr_number)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        if hostname:
+            _update_cache(hostname, alt_type)
+        forge = alt_forge
+
+    forge.print_threads(threads, status)
+
+
+def cmd_reply(args: list[str]) -> None:
+    """Handle 'reply' command to reply to a review thread."""
+    if len(args) < 2:
+        print("Usage: review reply <thread_id> <file|->", file=sys.stderr)
+        sys.exit(1)
+
+    thread_id = args[0]
+    body_source = args[1]
+
+    if body_source == "-":
+        body = sys.stdin.read()
+    else:
+        try:
+            with open(body_source, "r") as f:
+                body = f.read()
+        except FileNotFoundError:
+            print(f"Error: File not found: {body_source}", file=sys.stderr)
+            sys.exit(1)
+
+    if not body.strip():
+        print("Error: Comment body is empty", file=sys.stderr)
+        sys.exit(1)
+
+    hostname = _get_remote_hostname()
+    forge = detect_forge()
+
+    try:
+        forge.reply_to_thread(thread_id, body)
+    except RuntimeError:
+        # Self-healing: try the other forge
+        alt_forge, alt_type = _alternate_forge(forge)
+        try:
+            alt_forge.reply_to_thread(thread_id, body)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        if hostname:
+            _update_cache(hostname, alt_type)
+
+
+def cmd_help() -> None:
+    """Display help information."""
+    help_text = """review - Fetch and manage review comments from GitHub PRs and GitLab MRs
+
+Usage:
+    review get [MR_NUMBER]            # Get unresolved comments
+    review reply <thread_id> <file|-> # Reply to a review thread
+    review help                       # Show this help message
+
+Supported forges: GitHub (github.com), GitLab (any other hostname)
+Forge is auto-detected from git remote hostname and cached in
+~/.cache/review/forges.ini. Self-heals if the assumed forge API fails.
+
+Commands:
+    get [MR_NUMBER]
+        Fetch unresolved review comments for a PR or MR.
+        If MR_NUMBER is omitted, uses the current branch's PR/MR.
+
+    reply <thread_id> <file|->
+        Reply to a review thread using its thread ID.
+        Use '-' to read the comment body from stdin.
+        Use a file path to read the comment body from a file.
+
+Examples:
+    review get                        # Get comments for current PR/MR
+    review get 123                    # Get comments for PR/MR #123
+    review reply 1234567 response.md  # Reply with content from file
+    echo "LGTM" | review reply 1234567 -  # Reply with stdin
+"""
+    print(help_text)
+
+
+def main() -> None:
+    """Main entry point."""
+    if len(sys.argv) < 2:
+        print("Usage: review <command>", file=sys.stderr)
+        print("Run 'review help' for usage information.", file=sys.stderr)
+        sys.exit(1)
+
+    command = sys.argv[1]
+
+    if command == "get":
+        cmd_get(sys.argv[2:])
+    elif command == "reply":
+        cmd_reply(sys.argv[2:])
+    elif command in ("help", "-h", "--help"):
+        cmd_help()
+    else:
+        print(f"Unknown command: {command}", file=sys.stderr)
+        print("Run 'review help' for usage information.", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

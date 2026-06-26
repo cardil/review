@@ -1,71 +1,75 @@
-# gh-review
+# review
 
-A command-line tool for fetching and managing GitHub Pull Request review comments efficiently.
+A command-line tool for fetching and managing review comments from GitHub PRs and GitLab MRs.
 
 ## Overview
 
-`gh-review` simplifies the PR review workflow by providing a streamlined interface to view unresolved review comments and reply to review threads directly from the command line. It leverages the GitHub CLI (`gh`) to interact with GitHub's GraphQL and REST APIs.
+`review` simplifies the PR/MR review workflow by providing a streamlined interface to view unresolved review comments and reply to review threads directly from the command line. It auto-detects the forge (GitHub or GitLab) from git remotes and routes to the appropriate API. Same CLI interface regardless of forge.
 
 ## Features
 
-- **Fetch unresolved comments**: View all unresolved review threads for a PR with detailed statistics
+- **Multi-forge support**: Works with both GitHub and GitLab out of the box
+- **Auto-detection**: Detects forge type from git remote hostname, caches in `~/.cache/review/forges.ini`
+- **Self-healing**: If the assumed forge API fails, automatically tries the other forge and updates cache
+- **Fetch unresolved comments**: View all unresolved review threads for a PR/MR with detailed statistics
 - **Review approvals**: See review decision status and who approved, requested changes, or commented
-- **PR status summary**: Check mergeability, merge state, and CI/CD check status at a glance
+- **PR/MR status summary**: Check mergeability, merge state, and CI/CD check status at a glance
 - **Detailed check breakdown**: See which checks passed, failed, or are still pending
-- **Smart PR detection**: Automatically detects PR number from current branch or accepts explicit PR number
+- **Smart PR/MR detection**: Automatically detects PR/MR number from current branch or accepts explicit number
 - **Reply to threads**: Respond to review comments directly from the command line
-- **Pagination support**: Handles large PRs with many review threads
+- **Pagination support**: Handles large PRs with many review threads (GitHub)
 - **Status tracking**: Shows which threads are outdated, responded to, or still need attention
 - **Direct links**: Provides clickable URLs to each comment and check for easy navigation
 
 ## Requirements
 
 - Python 3.10 or higher
-- [GitHub CLI (`gh`)](https://cli.github.com/) installed and authenticated
-- Git repository with a configured GitHub remote
+- For GitHub: [GitHub CLI (`gh`)](https://cli.github.com/) installed and authenticated
+- For GitLab: [GitLab CLI (`glab`)](https://gitlab.com/gitlab-org/cli) installed and authenticated
+- Git repository with a configured remote
 
 ## Installation
 
-1. Clone this repository or download the `gh-review` script
+1. Clone this repository or download the `review` script
 2. Make the script executable:
    ```bash
-   chmod +x gh-review
+   chmod +x review
    ```
 3. (Optional) Add it to your PATH or create a symlink:
    ```bash
-   ln -s /path/to/gh-review ~/.local/bin/gh-review
+   ln -s /path/to/review ~/.local/bin/review
    ```
 
 ## Usage
 
 ### Fetch unresolved comments
 
-Get unresolved review comments for the current branch's PR:
+Get unresolved review comments for the current branch's PR/MR:
 ```bash
-gh-review get
+review get
 ```
 
-Get unresolved comments for a specific PR number:
+Get unresolved comments for a specific PR/MR number:
 ```bash
-gh-review get 123
+review get 123
 ```
 
 ### Reply to a review thread
 
 Reply to a thread using content from a file:
 ```bash
-gh-review reply 1234567890 response.md
+review reply 1234567890 response.md
 ```
 
 Reply to a thread using stdin:
 ```bash
-echo "Thanks for the review! Fixed in the latest commit." | gh-review reply 1234567890 -
+echo "Thanks for the review! Fixed in the latest commit." | review reply 1234567890 -
 ```
 
 ### Get help
 
 ```bash
-gh-review help
+review help
 ```
 
 ## Output Format
@@ -82,41 +86,49 @@ The `get` command displays:
   - Threads with responses
   - Outdated threads
 
-### PR Status
+### PR/MR Status
 - **Reviews**: Overall review decision (APPROVED, CHANGES_REQUESTED, etc.)
   - Individual reviewer statuses with usernames
   - Shows who approved, requested changes, or commented
-- **Mergeability**: Whether the PR can be merged (conflicts, etc.)
+- **Mergeability**: Whether the PR/MR can be merged (conflicts, etc.)
 - **Merge State**: Current state (CLEAN, BLOCKED, BEHIND, etc.)
 - **CI/CD Checks**: Overall status and detailed breakdown
   - Failed checks with links (shown first for quick attention)
   - Pending/in-progress checks
   - Passed checks (summarized count)
+- **Blocking discussions** (GitLab): Whether blocking discussions are resolved
 
 ## Examples
 
 ```bash
-# Check current PR for unresolved comments
-gh-review get
+# Check current PR/MR for unresolved comments
+review get
 
-# Check specific PR
-gh-review get 456
+# Check specific PR/MR
+review get 456
 
 # Reply to a comment
-echo "LGTM, thanks!" | gh-review reply 1234567890 -
+echo "LGTM, thanks!" | review reply 1234567890 -
 
 # Reply with a longer response from a file
-gh-review reply 1234567890 my-response.txt
+review reply 1234567890 my-response.txt
 ```
 
 ## How It Works
 
-`gh-review` uses:
-- **GitHub GraphQL API** to fetch review threads with pagination support
-- **GitHub REST API** to post replies to review threads
-- **GitHub CLI (`gh`)** as the authentication and API transport layer
+`review` supports two forges:
 
-The tool identifies review threads by their `discussion_r` ID, which can be found in the comment URL or in the output of the `get` command.
+**GitHub** (via `gh` CLI):
+- **GraphQL API** to fetch review threads with pagination support
+- **REST API** to post replies to review threads
+- Thread IDs are `discussion_r` numeric IDs from comment URLs
+
+**GitLab** (via `glab` CLI):
+- **REST API** to fetch MR discussions, status, and approvals
+- **REST API** to post replies to discussion threads
+- Thread IDs are hex discussion ID prefixes (first 8 characters)
+
+Forge is auto-detected from git remote hostname and cached in `~/.cache/review/forges.ini`. The `github.com` hostname defaults to GitHub. All other hostnames default to GitLab. If the initial assumption is wrong (e.g., a GitHub Enterprise instance), the tool self-heals by trying the other forge and updating the cache.
 
 ## License
 
