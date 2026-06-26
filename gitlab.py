@@ -5,7 +5,7 @@ import subprocess
 import sys
 import urllib.parse
 
-from review_forge import Forge
+from forge import Forge
 
 
 _MERGE_STATE_MAP = {

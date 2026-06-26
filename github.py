@@ -4,7 +4,7 @@ import json
 import subprocess
 import sys
 
-from review_forge import Forge
+from forge import Forge
 
 
 class GitHubForge(Forge):

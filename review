@@ -21,9 +21,9 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
-from review_forge import Forge  # noqa: E402
-from review_github import GitHubForge  # noqa: E402
-from review_gitlab import GitLabForge  # noqa: E402
+from forge import Forge  # noqa: E402
+from github import GitHubForge  # noqa: E402
+from gitlab import GitLabForge  # noqa: E402
 
 
 # ─── Cache / Forge Detection ─────────────────────────────────────────────────
