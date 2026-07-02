@@ -69,10 +69,11 @@ class Forge(abc.ABC):
                 if has_response or is_outdated:
                     addressed_count += 1
 
+                first_author = thread["comments"][0]["author"] if thread["comments"] else "unknown"
                 if path is not None:
-                    print(f"── Thread {thread_id}: {path}:{line}{outdated} ──")
+                    print(f"── Thread {thread_id} by @{first_author}: {path}:{line}{outdated} ──")
                 else:
-                    print(f"── Thread {thread_id}{outdated} ──")
+                    print(f"── Thread {thread_id} by @{first_author}{outdated} ──")
 
                 for idx, comment in enumerate(thread["comments"]):
                     author = comment["author"]

@@ -107,7 +107,7 @@ $ review get 42
 Fetching unresolved comments for owner/repo#42...
 📋 Found 2 unresolved review thread(s):
 
-── Thread 3423986075: src/main.py:15 ──
+── Thread 3423986075 by @reviewer1: src/main.py:15 ──
 
 Consider using a context manager here.
 
@@ -120,7 +120,7 @@ Good point, fixed in latest push.
 🔗 Link: https://github.com/owner/repo/pull/42#discussion_r3426283699
 
 == Thread end 3423986075: src/main.py:15 ==
-── Thread 3436744571: README.md:8 (outdated) ──
+── Thread 3436744571 by @reviewer2: README.md:8 (outdated) ──
 
 Typo in the description.
 
@@ -156,7 +156,7 @@ $ review get 1
 Fetching unresolved comments for group/project!1...
 📋 Found 1 unresolved review thread(s):
 
-── Thread 564776ce: docs/design.md:74 ──
+── Thread 564776ce by @reviewer1: docs/design.md:74 ──
 
 Should we add a sequence diagram here?
 
