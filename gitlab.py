@@ -5,7 +5,7 @@ import subprocess
 import sys
 import urllib.parse
 
-from forge import Forge
+from forge import Forge, get_current_branch
 
 
 _MERGE_STATE_MAP = {
@@ -47,16 +47,32 @@ class GitLabForge(Forge):
                 print(f"Error: Invalid MR number: {args[0]}", file=sys.stderr)
                 sys.exit(1)
 
+        branch_name = get_current_branch()
+
         result = subprocess.run(
-            ["glab", "mr", "view", "--output", "json"],
+            [
+                "glab", "mr", "list",
+                "--source-branch", branch_name,
+                "--output", "json",
+            ],
             capture_output=True,
             text=True,
         )
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            return data["iid"]
+        if result.returncode != 0:
+            raise RuntimeError(f"GitLab CLI error: {result.stderr.strip()}")
 
-        raise RuntimeError("Could not determine MR number")
+        try:
+            mrs = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"GitLab API error: unexpected output: {result.stdout[:200]}")
+
+        if len(mrs) == 1:
+            return mrs[0]["iid"]
+        if len(mrs) > 1:
+            ids = ", ".join(f"!{mr['iid']}" for mr in mrs)
+            raise RuntimeError(f"Multiple open MRs for this branch: {ids}. Specify one explicitly.")
+
+        raise RuntimeError("No open MR found for current branch")
 
     def _get_project_path(self) -> str:
         result = subprocess.run(

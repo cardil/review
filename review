@@ -120,13 +120,13 @@ def cmd_get(args: list[str]) -> None:
     try:
         mr_number = forge.get_mr_number(args)
         threads, status = forge.fetch_unresolved_threads(mr_number)
-    except RuntimeError:
+    except RuntimeError as primary_err:
         alt_forge, alt_type = _alternate_forge(forge)
         try:
             mr_number = alt_forge.get_mr_number(args)
             threads, status = alt_forge.fetch_unresolved_threads(mr_number)
-        except RuntimeError as e:
-            print(f"Error: {e}", file=sys.stderr)
+        except RuntimeError:
+            print(f"Error: {primary_err}", file=sys.stderr)
             sys.exit(1)
         if hostname:
             _update_cache(hostname, alt_type)
@@ -162,12 +162,12 @@ def cmd_reply(args: list[str]) -> None:
 
     try:
         forge.reply_to_thread(thread_id, body)
-    except RuntimeError:
+    except RuntimeError as primary_err:
         alt_forge, alt_type = _alternate_forge(forge)
         try:
             alt_forge.reply_to_thread(thread_id, body)
-        except RuntimeError as e:
-            print(f"Error: {e}", file=sys.stderr)
+        except RuntimeError:
+            print(f"Error: {primary_err}", file=sys.stderr)
             sys.exit(1)
         if hostname:
             _update_cache(hostname, alt_type)
