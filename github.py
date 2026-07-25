@@ -67,7 +67,7 @@ class GitHubForge(Forge):
                 except json.JSONDecodeError:
                     continue
                 mine = [pr["number"] for pr in prs
-                        if pr.get("headRepositoryOwner", {}).get("login") == origin_owner]
+                        if (pr.get("headRepositoryOwner") or {}).get("login") == origin_owner]
                 if len(mine) == 1:
                     parts = repo_nwo.split("/", 1)
                     self._repo_override = (parts[0], parts[1])
@@ -110,7 +110,7 @@ class GitHubForge(Forge):
             key, url = parts
             if "origin" in key:
                 continue
-            m = re.search(r"github\.com[:/]([^/]+/[^/.\s]+)", url)
+            m = re.search(r"github\.com[:/]([^/]+/[^/\s]+)", url)
             if m:
                 nwo = m.group(1).removesuffix(".git")
                 if nwo not in repos:
