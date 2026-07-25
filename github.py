@@ -343,8 +343,15 @@ class GitHubForge(Forge):
         raise RuntimeError(f"Could not find PR for comment {comment_id}")
 
     def reply_to_thread(self, thread_id: str, body: str) -> None:
+        try:
+            pr_number = self.get_mr_number([])
+        except (RuntimeError, SystemExit):
+            pr_number = None
+
         owner, repo = self._get_repo_info()
-        pr_number = self._get_pr_for_comment(owner, repo, thread_id)
+
+        if pr_number is None:
+            pr_number = self._get_pr_for_comment(owner, repo, thread_id)
 
         url = f"/repos/{owner}/{repo}/pulls/{pr_number}/comments/{thread_id}/replies"
         result = subprocess.run(
