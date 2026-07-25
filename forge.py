@@ -1,7 +1,19 @@
 """Forge abstraction for review tool -- shared base class and display logic."""
 
 import abc
+import subprocess
 import sys
+
+
+def get_current_branch() -> str:
+    result = subprocess.run(
+        ["git", "branch", "--show-current"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError("Could not determine current branch")
+    return result.stdout.strip()
 
 
 class Forge(abc.ABC):

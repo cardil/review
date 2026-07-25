@@ -1,13 +1,17 @@
 """GitHub forge implementation using gh CLI."""
 
 import json
+import re
 import subprocess
 import sys
 
-from forge import Forge
+from forge import Forge, get_current_branch
 
 
 class GitHubForge(Forge):
+
+    def __init__(self) -> None:
+        self._repo_override: tuple[str, str] | None = None
 
     def get_mr_number(self, args: list[str]) -> int:
         if args:
@@ -17,17 +21,106 @@ class GitHubForge(Forge):
                 print(f"Error: Invalid PR number: {args[0]}", file=sys.stderr)
                 sys.exit(1)
 
+        branch_name = get_current_branch()
+
         result = subprocess.run(
-            ["gh", "pr", "view", "--json", "number", "--jq", ".number"],
+            [
+                "gh", "pr", "list",
+                "--head", branch_name,
+                "--state", "open",
+                "--json", "number",
+                "--jq", ".[].number",
+            ],
             capture_output=True,
             text=True,
         )
-        if result.returncode == 0:
-            return int(result.stdout.strip())
+        if result.returncode != 0:
+            raise RuntimeError(f"GitHub CLI error: {result.stderr.strip()}")
+        if result.stdout.strip():
+            numbers = result.stdout.strip().splitlines()
+            if len(numbers) == 1:
+                return int(numbers[0])
+            if len(numbers) > 1:
+                ids = ", ".join(f"#{n}" for n in numbers)
+                raise RuntimeError(f"Multiple open PRs for this branch: {ids}. Specify one explicitly.")
 
-        raise RuntimeError("Could not determine PR number")
+        origin_owner = self._get_origin_owner()
+        if origin_owner:
+            for repo_nwo in self._get_upstream_repos():
+                result = subprocess.run(
+                    [
+                        "gh", "pr", "list",
+                        "--repo", repo_nwo,
+                        "--head", branch_name,
+                        "--state", "open",
+                        "--json", "number,headRepositoryOwner",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    continue
+                if not result.stdout.strip():
+                    continue
+                try:
+                    prs = json.loads(result.stdout)
+                except json.JSONDecodeError:
+                    continue
+                mine = [pr["number"] for pr in prs
+                        if (pr.get("headRepositoryOwner") or {}).get("login") == origin_owner]
+                if len(mine) == 1:
+                    parts = repo_nwo.split("/", 1)
+                    self._repo_override = (parts[0], parts[1])
+                    return mine[0]
+                if len(mine) > 1:
+                    ids = ", ".join(f"#{n}" for n in mine)
+                    raise RuntimeError(
+                        f"Multiple open PRs for this branch in {repo_nwo}: {ids}. Specify one explicitly."
+                    )
+
+        raise RuntimeError("No open PR found for current branch")
+
+    @staticmethod
+    def _get_origin_owner() -> str | None:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        url = result.stdout.strip()
+        m = re.search(r"github\.com[:/]([^/]+)/", url)
+        return m.group(1) if m else None
+
+    @staticmethod
+    def _get_upstream_repos() -> list[str]:
+        result = subprocess.run(
+            ["git", "config", "--get-regexp", r"remote\..*\.url"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return []
+        repos = []
+        for line in result.stdout.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) < 2:
+                continue
+            key, url = parts
+            if "origin" in key:
+                continue
+            m = re.search(r"github\.com[:/]([^/]+/[^/\s]+)", url)
+            if m:
+                nwo = m.group(1).removesuffix(".git")
+                if nwo not in repos:
+                    repos.append(nwo)
+        return repos
 
     def _get_repo_info(self) -> tuple[str, str]:
+        if self._repo_override:
+            return self._repo_override
+
         result = subprocess.run(
             [
                 "gh",
@@ -250,8 +343,15 @@ class GitHubForge(Forge):
         raise RuntimeError(f"Could not find PR for comment {comment_id}")
 
     def reply_to_thread(self, thread_id: str, body: str) -> None:
+        try:
+            pr_number = self.get_mr_number([])
+        except (RuntimeError, SystemExit):
+            pr_number = None
+
         owner, repo = self._get_repo_info()
-        pr_number = self._get_pr_for_comment(owner, repo, thread_id)
+
+        if pr_number is None:
+            pr_number = self._get_pr_for_comment(owner, repo, thread_id)
 
         url = f"/repos/{owner}/{repo}/pulls/{pr_number}/comments/{thread_id}/replies"
         result = subprocess.run(
