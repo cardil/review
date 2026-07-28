@@ -116,6 +116,13 @@ class Forge(abc.ABC):
         _print_status(status)
 
     @abc.abstractmethod
+    def get_thread_author(self, thread_id: str) -> str | None:
+        """Return the username of the thread's opening comment author.
+
+        Returns None if the author cannot be determined.
+        """
+
+    @abc.abstractmethod
     def reply_to_thread(self, thread_id: str, body: str) -> None:
         """Reply to a review thread."""
 

@@ -193,7 +193,14 @@ class GitLabForge(Forge):
 
         return normalized_threads, normalized_status
 
-    def reply_to_thread(self, thread_id: str, body: str) -> None:
+    def _resolve_discussion(
+        self, thread_id: str,
+    ) -> tuple[str, str, int, dict] | None:
+        """Find exactly one discussion matching *thread_id* prefix.
+
+        Returns ``(encoded_path, full_discussion_id, mr_number, discussion)``
+        or ``None`` when zero or multiple discussions match.
+        """
         project_path = self._get_project_path()
         encoded_path = urllib.parse.quote(project_path, safe="")
         mr_number = self.get_mr_number([])
@@ -204,23 +211,59 @@ class GitLabForge(Forge):
         )
 
         matches = [
-            disc.get("id", "")
+            disc
             for disc in discussions
             if disc.get("id", "").startswith(thread_id)
         ]
 
-        if len(matches) == 0:
-            print(f"Error: No discussion found matching prefix '{thread_id}'", file=sys.stderr)
-            sys.exit(1)
-        elif len(matches) > 1:
-            print(
-                f"Error: Ambiguous thread ID '{thread_id}', matches:", file=sys.stderr
-            )
-            for m in matches:
-                print(f"  {m}", file=sys.stderr)
-            sys.exit(1)
+        if len(matches) != 1:
+            return None
 
-        full_discussion_id = matches[0]
+        return encoded_path, matches[0].get("id", ""), mr_number, matches[0]
+
+    def get_thread_author(self, thread_id: str) -> str | None:
+        try:
+            resolved = self._resolve_discussion(thread_id)
+        except (RuntimeError, json.JSONDecodeError, Exception):
+            return None
+
+        if resolved is None:
+            return None
+
+        _, _, _, discussion = resolved
+        notes = discussion.get("notes", [])
+        if notes:
+            return notes[0].get("author", {}).get("username")
+        return None
+
+    def reply_to_thread(self, thread_id: str, body: str) -> None:
+        resolved = self._resolve_discussion(thread_id)
+
+        if resolved is None:
+            project_path = self._get_project_path()
+            encoded_path = urllib.parse.quote(project_path, safe="")
+            mr_number = self.get_mr_number([])
+            discussions = self._api_get(
+                f"projects/{encoded_path}/merge_requests/{mr_number}/discussions",
+                paginate=True,
+            )
+            matches = [
+                disc.get("id", "")
+                for disc in discussions
+                if disc.get("id", "").startswith(thread_id)
+            ]
+            if len(matches) == 0:
+                print(f"Error: No discussion found matching prefix '{thread_id}'", file=sys.stderr)
+                sys.exit(1)
+            else:
+                print(
+                    f"Error: Ambiguous thread ID '{thread_id}', matches:", file=sys.stderr
+                )
+                for m in matches:
+                    print(f"  {m}", file=sys.stderr)
+                sys.exit(1)
+
+        encoded_path, full_discussion_id, mr_number, _ = resolved
 
         result = subprocess.run(
             [

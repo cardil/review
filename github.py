@@ -342,6 +342,48 @@ class GitHubForge(Forge):
 
         raise RuntimeError(f"Could not find PR for comment {comment_id}")
 
+    def get_thread_author(self, thread_id: str) -> str | None:
+        try:
+            owner, repo = self._get_repo_info()
+            comment = self._fetch_comment(owner, repo, thread_id)
+            if comment is None:
+                return None
+
+            while comment.get("in_reply_to_id"):
+                parent = self._fetch_comment(
+                    owner, repo, str(comment["in_reply_to_id"]),
+                )
+                if parent is None:
+                    break
+                comment = parent
+
+            user = comment.get("user")
+            if user:
+                return self._mentionable_handle(user)
+        except (RuntimeError, json.JSONDecodeError, Exception):
+            pass
+        return None
+
+    @staticmethod
+    def _mentionable_handle(user: dict) -> str | None:
+        if user.get("type") == "Bot":
+            html_url = user.get("html_url", "")
+            if "/apps/" in html_url:
+                return html_url.rsplit("/apps/", 1)[-1]
+        return user.get("login") or None
+
+    @staticmethod
+    def _fetch_comment(owner: str, repo: str, comment_id: str) -> dict | None:
+        url = f"/repos/{owner}/{repo}/pulls/comments/{comment_id}"
+        result = subprocess.run(
+            ["gh", "api", url],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        return json.loads(result.stdout)
+
     def reply_to_thread(self, thread_id: str, body: str) -> None:
         try:
             pr_number = self.get_mr_number([])
