@@ -359,10 +359,18 @@ class GitHubForge(Forge):
 
             user = comment.get("user")
             if user:
-                return user.get("login")
+                return self._mentionable_handle(user)
         except (RuntimeError, json.JSONDecodeError, Exception):
             pass
         return None
+
+    @staticmethod
+    def _mentionable_handle(user: dict) -> str | None:
+        if user.get("type") == "Bot":
+            html_url = user.get("html_url", "")
+            if "/apps/" in html_url:
+                return html_url.rsplit("/apps/", 1)[-1]
+        return user.get("login") or None
 
     @staticmethod
     def _fetch_comment(owner: str, repo: str, comment_id: str) -> dict | None:
