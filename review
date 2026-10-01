@@ -6,6 +6,7 @@ Based on: https://stackoverflow.com/a/66072198/844449
 Usage:
     review get [MR_NUMBER]            # Get unresolved comments
     review reply <thread_id> <file|-> # Reply to a review thread
+    review reply <target> <thread_id> <file|-> # Reply to an explicit PR/MR
 """
 
 import configparser
@@ -88,6 +89,18 @@ def _alternate_forge(forge: Forge) -> tuple[Forge, str]:
     return GitHubForge(), "github"
 
 
+def _forge_for_target(target: str, forge: Forge) -> tuple[Forge, str | None]:
+    if "#" in target:
+        if isinstance(forge, GitHubForge):
+            return forge, "github"
+        return GitHubForge(), "github"
+    if "!" in target:
+        if isinstance(forge, GitLabForge):
+            return forge, "gitlab"
+        return GitLabForge(), "gitlab"
+    return forge, None
+
+
 def detect_forge() -> Forge:
     hostname = _get_remote_hostname()
     if not hostname:
@@ -113,6 +126,8 @@ def detect_forge() -> Forge:
 def cmd_get(args: list[str]) -> None:
     hostname = _get_remote_hostname()
     forge = detect_forge()
+    if args:
+        forge, _ = _forge_for_target(args[0], forge)
 
     threads: list[dict] | None = None
     status: dict | None = None
@@ -149,12 +164,20 @@ def _prepend_author(forge: Forge, thread_id: str, body: str) -> str:
 
 
 def cmd_reply(args: list[str]) -> None:
-    if len(args) < 2:
-        print("Usage: review reply <thread_id> <file|->", file=sys.stderr)
+    target: str | None = None
+    if len(args) == 2 and "#" not in args[0] and "!" not in args[0]:
+        thread_id = args[0]
+        body_source = args[1]
+    elif len(args) == 3 and ("#" in args[0] or "!" in args[0]):
+        target = args[0]
+        thread_id = args[1]
+        body_source = args[2]
+    else:
+        print(
+            "Usage: review reply [<target>] <thread_id> <file|->",
+            file=sys.stderr,
+        )
         sys.exit(1)
-
-    thread_id = args[0]
-    body_source = args[1]
 
     if body_source == "-":
         body = sys.stdin.read()
@@ -172,13 +195,19 @@ def cmd_reply(args: list[str]) -> None:
 
     hostname = _get_remote_hostname()
     forge = detect_forge()
+    if target is not None:
+        forge, _ = _forge_for_target(target, forge)
 
     try:
+        if target is not None:
+            forge.get_mr_number([target])
         body = _prepend_author(forge, thread_id, body)
         forge.reply_to_thread(thread_id, body)
     except RuntimeError as primary_err:
         alt_forge, alt_type = _alternate_forge(forge)
         try:
+            if target is not None:
+                alt_forge.get_mr_number([target])
             body = _prepend_author(alt_forge, thread_id, body)
             alt_forge.reply_to_thread(thread_id, body)
         except RuntimeError:
@@ -194,6 +223,7 @@ def cmd_help() -> None:
 Usage:
     review get [MR_NUMBER]            # Get unresolved comments
     review reply <thread_id> <file|-> # Reply to a review thread
+    review reply <target> <thread_id> <file|-> # Reply to an explicit PR/MR
     review help                       # Show this help message
 
 Supported forges: GitHub (github.com), GitLab (any other hostname)
@@ -204,17 +234,25 @@ Commands:
     get [MR_NUMBER]
         Fetch unresolved review comments for a PR or MR.
         If MR_NUMBER is omitted, uses the current branch's PR/MR.
+        GitHub targets: owner/repo#number or owner#number.
+        GitLab targets: owner/repo!number.
 
-    reply <thread_id> <file|->
+    reply [<target>] <thread_id> <file|->
         Reply to a review thread using its thread ID.
+        An explicit target uses the same GitHub or GitLab coordinate forms.
+        Numeric thread IDs remain supported in the two-argument form.
         Use '-' to read the comment body from stdin.
         Use a file path to read the comment body from a file.
 
 Examples:
     review get                        # Get comments for current PR/MR
     review get 123                    # Get comments for PR/MR #123
+    review get owner/repo#94           # GitHub PR by repository and number
+    review get owner#94                # GitHub PR using current repo name
+    review get owner/repo!94           # GitLab MR by project and number
     review reply 1234567 response.md  # Reply with content from file
     echo "LGTM" | review reply 1234567 -  # Reply with stdin
+    echo "LGTM" | review reply owner/repo#94 1234567 -  # Explicit GitHub PR
 """
     print(help_text)
 
