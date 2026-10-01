@@ -3,7 +3,6 @@
 import json
 import re
 import subprocess
-import sys
 
 from forge import Forge, get_current_branch
 
@@ -12,89 +11,116 @@ class GitHubForge(Forge):
 
     def __init__(self) -> None:
         self._repo_override: tuple[str, str] | None = None
+        self._mr_number_override: int | None = None
 
     def get_mr_number(self, args: list[str]) -> int:
         if args:
+            target = args[0]
             try:
-                return int(args[0])
+                number = int(target)
             except ValueError:
-                print(f"Error: Invalid PR number: {args[0]}", file=sys.stderr)
-                sys.exit(1)
+                match = re.fullmatch(
+                    r"(?P<owner>[^/#\s]+)(?:/(?P<repo>[^/#\s]+))?#(?P<number>\d+)",
+                    target,
+                )
+                if not match:
+                    raise RuntimeError(f"Invalid PR number: {target}")
+                owner = match.group("owner")
+                repo = match.group("repo")
+                if repo is None:
+                    _, repo = self._get_repo_info()
+                self._repo_override = (owner, repo)
+                number = int(match.group("number"))
+            self._mr_number_override = number
+            return number
+
+        if self._mr_number_override is not None:
+            return self._mr_number_override
 
         branch_name = get_current_branch()
 
-        result = subprocess.run(
-            [
-                "gh", "pr", "list",
-                "--head", branch_name,
-                "--state", "open",
-                "--json", "number",
-                "--jq", ".[].number",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"GitHub CLI error: {result.stderr.strip()}")
-        if result.stdout.strip():
-            numbers = result.stdout.strip().splitlines()
-            if len(numbers) == 1:
-                return int(numbers[0])
-            if len(numbers) > 1:
-                ids = ", ".join(f"#{n}" for n in numbers)
-                raise RuntimeError(f"Multiple open PRs for this branch: {ids}. Specify one explicitly.")
+        configured_repos = self._get_github_repos()
+        if configured_repos:
+            repos = configured_repos
+            head_repos: set[str] | None = {
+                repo.casefold() for repo in configured_repos
+            }
+        else:
+            owner, repo = self._get_repo_info()
+            repos = [f"{owner}/{repo}"]
+            head_repos = None
 
-        origin_owner = self._get_origin_owner()
-        if origin_owner:
-            for repo_nwo in self._get_upstream_repos():
-                result = subprocess.run(
-                    [
-                        "gh", "pr", "list",
-                        "--repo", repo_nwo,
-                        "--head", branch_name,
-                        "--state", "open",
-                        "--json", "number,headRepositoryOwner",
-                    ],
-                    capture_output=True,
-                    text=True,
+        matches: list[tuple[str, int]] = []
+        failed_queries = 0
+        last_cli_error: str | None = None
+        for repo_nwo in repos:
+            result = subprocess.run(
+                [
+                    "gh", "pr", "list",
+                    "--repo", repo_nwo,
+                    "--head", branch_name,
+                    "--state", "open",
+                    "--json", "number,headRepositoryOwner,headRepository",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                failed_queries += 1
+                last_cli_error = result.stderr.strip() or f"exit status {result.returncode}"
+                continue
+            if not result.stdout.strip():
+                continue
+            try:
+                prs = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(prs, list):
+                continue
+
+            repo_matches = []
+            for pr in prs:
+                if not isinstance(pr, dict):
+                    continue
+                head_owner = pr.get("headRepositoryOwner")
+                head_repo = pr.get("headRepository")
+                if not isinstance(head_owner, dict) or not isinstance(head_repo, dict):
+                    continue
+                owner_login = head_owner.get("login")
+                repo_name = head_repo.get("name")
+                number = pr.get("number")
+                if not isinstance(owner_login, str) or not isinstance(repo_name, str):
+                    continue
+                if not isinstance(number, int):
+                    continue
+                if head_repos is None or f"{owner_login}/{repo_name}".casefold() in head_repos:
+                    repo_matches.append(number)
+
+            if len(repo_matches) > 1:
+                ids = ", ".join(f"#{number}" for number in repo_matches)
+                raise RuntimeError(
+                    f"Multiple open PRs for this branch in {repo_nwo}: {ids}. Specify one explicitly."
                 )
-                if result.returncode != 0:
-                    continue
-                if not result.stdout.strip():
-                    continue
-                try:
-                    prs = json.loads(result.stdout)
-                except json.JSONDecodeError:
-                    continue
-                mine = [pr["number"] for pr in prs
-                        if (pr.get("headRepositoryOwner") or {}).get("login") == origin_owner]
-                if len(mine) == 1:
-                    parts = repo_nwo.split("/", 1)
-                    self._repo_override = (parts[0], parts[1])
-                    return mine[0]
-                if len(mine) > 1:
-                    ids = ", ".join(f"#{n}" for n in mine)
-                    raise RuntimeError(
-                        f"Multiple open PRs for this branch in {repo_nwo}: {ids}. Specify one explicitly."
-                    )
+            if len(repo_matches) == 1:
+                matches.append((repo_nwo, repo_matches[0]))
+
+        if len(matches) > 1:
+            ids = ", ".join(f"#{number}" for _, number in matches)
+            raise RuntimeError(f"Multiple open PRs for this branch: {ids}. Specify one explicitly.")
+        if matches:
+            repo_nwo, number = matches[0]
+            owner, repo = repo_nwo.split("/", 1)
+            self._repo_override = (owner, repo)
+            self._mr_number_override = number
+            return number
+
+        if failed_queries == len(repos) and last_cli_error is not None:
+            raise RuntimeError(f"GitHub CLI error: {last_cli_error}")
 
         raise RuntimeError("No open PR found for current branch")
 
     @staticmethod
-    def _get_origin_owner() -> str | None:
-        result = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            return None
-        url = result.stdout.strip()
-        m = re.search(r"github\.com[:/]([^/]+)/", url)
-        return m.group(1) if m else None
-
-    @staticmethod
-    def _get_upstream_repos() -> list[str]:
+    def _get_github_repos() -> list[str]:
         result = subprocess.run(
             ["git", "config", "--get-regexp", r"remote\..*\.url"],
             capture_output=True,
@@ -103,17 +129,18 @@ class GitHubForge(Forge):
         if result.returncode != 0:
             return []
         repos = []
+        seen: set[str] = set()
         for line in result.stdout.splitlines():
             parts = line.split(None, 1)
             if len(parts) < 2:
                 continue
-            key, url = parts
-            if "origin" in key:
-                continue
+            _, url = parts
             m = re.search(r"github\.com[:/]([^/]+/[^/\s]+)", url)
             if m:
                 nwo = m.group(1).removesuffix(".git")
-                if nwo not in repos:
+                key = nwo.casefold()
+                if key not in seen:
+                    seen.add(key)
                     repos.append(nwo)
         return repos
 
