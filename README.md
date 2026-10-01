@@ -54,6 +54,13 @@ Get unresolved comments for a specific PR/MR number:
 review get 123
 ```
 
+Explicit coordinates select the repository or project as well as the number:
+```bash
+review get owner/repo#94  # GitHub
+review get owner#94       # GitHub, using the current repository name
+review get owner/repo!94 # GitLab
+```
+
 ### Reply to a review thread
 
 Reply to a thread using content from a file:
@@ -65,6 +72,12 @@ Reply to a thread using stdin:
 ```bash
 echo "Thanks for the review! Fixed in the latest commit." | review reply 1234567890 -
 ```
+
+Use the same coordinate forms to reply to a thread in an explicit PR/MR:
+```bash
+echo "LGTM" | review reply owner/repo#94 1234567890 -
+```
+The legacy `review reply <thread_id> <file|->` form remains supported.
 
 ### Get help
 
@@ -198,11 +211,19 @@ review get
 # Check specific PR/MR
 review get 456
 
+# Check an explicit GitHub PR, GitHub short coordinate, or GitLab MR
+review get owner/repo#94
+review get owner#94
+review get owner/repo!94
+
 # Reply to a comment
 echo "LGTM, thanks!" | review reply 1234567890 -
 
 # Reply with a longer response from a file
 review reply 1234567890 my-response.txt
+
+# Reply to a thread in an explicit PR/MR
+review reply owner/repo#94 1234567890 response.txt
 ```
 
 ## How It Works
