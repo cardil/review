@@ -1,6 +1,7 @@
 """GitLab forge implementation using glab CLI."""
 
 import json
+import re
 import subprocess
 import sys
 import urllib.parse
@@ -39,13 +40,29 @@ _PIPELINE_STATE_MAP = {
 
 class GitLabForge(Forge):
 
+    def __init__(self) -> None:
+        self._project_path_override: str | None = None
+        self._mr_number_override: int | None = None
+
     def get_mr_number(self, args: list[str]) -> int:
         if args:
+            target = args[0]
             try:
-                return int(args[0])
+                number = int(target)
             except ValueError:
-                print(f"Error: Invalid MR number: {args[0]}", file=sys.stderr)
-                sys.exit(1)
+                match = re.fullmatch(
+                    r"(?P<project>[^!/\s]+(?:/[^!/\s]+)+)!(?P<number>\d+)",
+                    target,
+                )
+                if not match:
+                    raise RuntimeError(f"Invalid MR number: {target}")
+                self._project_path_override = match.group("project")
+                number = int(match.group("number"))
+            self._mr_number_override = number
+            return number
+
+        if self._mr_number_override is not None:
+            return self._mr_number_override
 
         branch_name = get_current_branch()
 
@@ -75,6 +92,9 @@ class GitLabForge(Forge):
         raise RuntimeError("No open MR found for current branch")
 
     def _get_project_path(self) -> str:
+        if self._project_path_override:
+            return self._project_path_override
+
         result = subprocess.run(
             ["glab", "repo", "view", "--output", "json"],
             capture_output=True,
